@@ -18,26 +18,33 @@ function verifyPassword(pw, stored) {
 }
 const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
-function createSession(db, userId) {
+async function createSession(db, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
   const exp = Date.now() + SESSION_DAYS * 86400e3;
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)').run(sha(token), userId, exp);
+  await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)').run(sha(token), userId, exp);
   return { token, exp };
 }
-function userFromToken(db, token) {
+async function userFromToken(db, token) {
   if (!token) return null;
-  const row = db.prepare(`SELECT u.id, u.username, u.nama, u.role, s.expires_at, s.token_hash FROM sessions s
+  const row = await db.prepare(`SELECT u.id, u.username, u.nama, u.role, s.expires_at, s.token_hash FROM sessions s
     JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND u.aktif = 1`).get(sha(token));
   if (!row) return null;
-  if (row.expires_at < Date.now()) { db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(row.token_hash); return null; }
-  return { id: row.id, username: row.username, nama: row.nama, role: row.role };
+  if (Number(row.expires_at) < Date.now()) {
+    await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(row.token_hash);
+    return null;
+  }
+  return { id: Number(row.id), username: row.username, nama: row.nama, role: row.role };
 }
-function destroySession(db, token) { if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha(token)); }
-function destroyUserSessions(db, userId, exceptToken) {
-  if (exceptToken) db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(userId, sha(exceptToken));
-  else db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+async function destroySession(db, token) {
+  if (token) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha(token));
 }
-function purgeExpired(db) { db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now()); }
+async function destroyUserSessions(db, userId, exceptToken) {
+  if (exceptToken) await db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(userId, sha(exceptToken));
+  else await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+}
+async function purgeExpired(db) {
+  await db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+}
 
 function parseCookies(header) {
   const out = {};
