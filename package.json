@@ -1,0 +1,11 @@
+{
+  "name": "absensi-sd",
+  "version": "1.0.0",
+  "description": "Aplikasi absensi siswa sekolah dasar (Node.js + SQLite, tanpa dependensi)",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  }
+}
