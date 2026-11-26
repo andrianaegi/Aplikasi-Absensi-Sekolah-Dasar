@@ -71,12 +71,19 @@ function wrapExecutor(execObj) {
     },
     async exec(sql) {
       const stmts = sql.split(';').map((s) => s.trim()).filter(Boolean);
-      for (const s of stmts) {
-        await execObj.execute(s);
+      if (!stmts.length) return;
+      if (typeof execObj.batch === 'function') {
+        await execObj.batch(stmts, 'write');
+      } else {
+        for (const s of stmts) {
+          await execObj.execute(s);
+        }
       }
     }
   };
 }
+
+let schemaInitialized = false;
 
 function open(file) {
   let client;
@@ -96,11 +103,22 @@ function open(file) {
   const wrapper = wrapExecutor(client);
   wrapper._client = client;
 
-  const ready = (async () => {
-    await client.execute('PRAGMA foreign_keys = ON');
-    for (const stmt of SCHEMA) {
-      await client.execute(stmt);
+  wrapper.batch = async (stmts) => {
+    if (!stmts.length) return [];
+    if (typeof client.batch === 'function') {
+      return await client.batch(stmts, 'write');
     }
+    const out = [];
+    for (const s of stmts) {
+      out.push(await client.execute(s));
+    }
+    return out;
+  };
+
+  const ready = (async () => {
+    if (schemaInitialized && file !== ':memory:') return;
+    await client.batch(['PRAGMA foreign_keys = ON', ...SCHEMA], 'write');
+    if (file !== ':memory:') schemaInitialized = true;
   })();
 
   wrapper.ready = ready;

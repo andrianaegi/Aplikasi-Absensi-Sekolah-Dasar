@@ -46,9 +46,11 @@ const school = async (db) => ({ nama: await getSetting(db, 'school_nama', 'Sekol
 async function buildRekap(db, kelas, month) {
   const [y, m] = month.split('-').map(Number);
   const n = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  const students = await db.prepare('SELECT id, nama, nis, jk FROM students WHERE kelas_id = ? ORDER BY nama COLLATE NOCASE').all(kelas.id);
-  const rows = await db.prepare(`SELECT a.student_id, a.tanggal, a.status FROM attendance a JOIN students s ON s.id = a.student_id
-    WHERE s.kelas_id = ? AND a.tanggal BETWEEN ? AND ?`).all(kelas.id, `${month}-01`, `${month}-${String(n).padStart(2, '0')}`);
+  const [students, rows] = await Promise.all([
+    db.prepare('SELECT id, nama, nis, jk FROM students WHERE kelas_id = ? ORDER BY nama COLLATE NOCASE').all(kelas.id),
+    db.prepare(`SELECT a.student_id, a.tanggal, a.status FROM attendance a JOIN students s ON s.id = a.student_id
+      WHERE s.kelas_id = ? AND a.tanggal BETWEEN ? AND ?`).all(kelas.id, `${month}-01`, `${month}-${String(n).padStart(2, '0')}`)
+  ]);
   const by = new Map(students.map((s) => [Number(s.id), { id: Number(s.id), nama: s.nama, nis: s.nis, jk: s.jk, days: {}, H: 0, S: 0, I: 0, A: 0 }]));
   for (const r of rows) {
     const o = by.get(Number(r.student_id));
@@ -78,15 +80,13 @@ on('POST', '/api/setup', false, async ({ db, body }) => {
   if (!/^[A-Za-z0-9_.-]+$/.test(username)) throw bad('Nama pengguna hanya boleh huruf, angka, titik, garis bawah, dan strip.');
   checkPassword(body.password);
   const sekolah = reqStr(body.sekolah, 100, 'Nama sekolah');
-  await tx(db, async (tdb) => {
-    await tdb.prepare('INSERT INTO users (username, nama, role, password_hash) VALUES (?,?,?,?)').run(username, nama, 'admin', auth.hashPassword(body.password));
-    await setSetting(tdb, 'school_nama', sekolah);
-    await setSetting(tdb, 'school_tahun', str(body.tahun, 20, 'Tahun ajaran'));
-    const ins = tdb.prepare('INSERT OR IGNORE INTO kelas (nama) VALUES (?)');
-    for (const k of ['1', '2', '3', '4', '5', '6']) {
-      await ins.run(k);
-    }
-  });
+  const stmts = [
+    { sql: 'INSERT INTO users (username, nama, role, password_hash) VALUES (?,?,?,?)', args: [username, nama, 'admin', auth.hashPassword(body.password)] },
+    { sql: 'INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['school_nama', sekolah] },
+    { sql: 'INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['school_tahun', str(body.tahun, 20, 'Tahun ajaran')] },
+    ...['1', '2', '3', '4', '5', '6'].map((k) => ({ sql: 'INSERT OR IGNORE INTO kelas (nama) VALUES (?)', args: [k] }))
+  ];
+  await db.batch(stmts);
   return { ok: true };
 });
 
@@ -109,11 +109,10 @@ on('POST', '/api/logout', false, async ({ db, ctx }) => {
   return { ok: true };
 });
 
-on('GET', '/api/me', 'user', async ({ db, user }) => ({
-  user,
-  school: await school(db),
-  kelas: await kelasForUser(db, user)
-}));
+on('GET', '/api/me', 'user', async ({ db, user }) => {
+  const [schoolInfo, kelasList] = await Promise.all([school(db), kelasForUser(db, user)]);
+  return { user, school: schoolInfo, kelas: kelasList };
+});
 
 on('POST', '/api/me/password', 'user', async ({ db, user, body, ctx }) => {
   const u = await db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
@@ -156,31 +155,34 @@ on('POST', '/api/students/import', 'user', async ({ db, user, body }) => {
   const def = await requireKelas(db, user, body.kelas_id);
   if (!Array.isArray(body.rows) || !body.rows.length) throw bad('Tidak ada baris untuk diimpor.');
   if (body.rows.length > 2000) throw bad('Maksimal 2000 baris per impor.');
-  const allowed = new Map((await kelasForUser(db, user)).map((k) => [k.nama.toLowerCase(), k]));
-  const nisSeen = new Set((await db.prepare("SELECT nis FROM students WHERE nis != ''").all()).map((r) => r.nis));
-  const nmSeen = new Set((await db.prepare("SELECT lower(nama) || '|' || kelas_id AS k FROM students").all()).map((r) => r.k));
-  const skipped = []; let added = 0;
-  await tx(db, async (tdb) => {
-    const ins = tdb.prepare('INSERT INTO students (nama, nis, jk, kelas_id) VALUES (?,?,?,?)');
-    for (let i = 0; i < body.rows.length; i++) {
-      const r = body.rows[i];
-      const baris = i + 1;
-      const nama = String((r && r.nama) || '').trim().slice(0, 100), nis = String((r && r.nis) || '').trim().slice(0, 30);
-      if (!nama) { skipped.push({ baris, alasan: 'Nama kosong' }); continue; }
-      let k = def; const kn = String((r && r.kelas) || '').trim();
-      if (kn) {
-        k = allowed.get(kn.toLowerCase());
-        if (!k) { skipped.push({ baris, nama, alasan: `Kelas "${kn.slice(0, 20)}" tidak ada atau bukan kelas Anda` }); continue; }
-      }
-      const key = nama.toLowerCase() + '|' + k.id;
-      if ((nis && nisSeen.has(nis)) || nmSeen.has(key)) { skipped.push({ baris, nama, alasan: 'Sudah ada' }); continue; }
-      await ins.run(nama, nis, jkOf(r.jk), k.id);
-      added++;
-      if (nis) nisSeen.add(nis);
-      nmSeen.add(key);
+  const [userKelasList, nisRows, nmRows] = await Promise.all([
+    kelasForUser(db, user),
+    db.prepare("SELECT nis FROM students WHERE nis != ''").all(),
+    db.prepare("SELECT lower(nama) || '|' || kelas_id AS k FROM students").all()
+  ]);
+  const allowed = new Map(userKelasList.map((k) => [k.nama.toLowerCase(), k]));
+  const nisSeen = new Set(nisRows.map((r) => r.nis));
+  const nmSeen = new Set(nmRows.map((r) => r.k));
+  const skipped = [];
+  const stmts = [];
+  for (let i = 0; i < body.rows.length; i++) {
+    const r = body.rows[i];
+    const baris = i + 1;
+    const nama = String((r && r.nama) || '').trim().slice(0, 100), nis = String((r && r.nis) || '').trim().slice(0, 30);
+    if (!nama) { skipped.push({ baris, alasan: 'Nama kosong' }); continue; }
+    let k = def; const kn = String((r && r.kelas) || '').trim();
+    if (kn) {
+      k = allowed.get(kn.toLowerCase());
+      if (!k) { skipped.push({ baris, nama, alasan: `Kelas "${kn.slice(0, 20)}" tidak ada atau bukan kelas Anda` }); continue; }
     }
-  });
-  return { added, skipped };
+    const key = nama.toLowerCase() + '|' + k.id;
+    if ((nis && nisSeen.has(nis)) || nmSeen.has(key)) { skipped.push({ baris, nama, alasan: 'Sudah ada' }); continue; }
+    stmts.push({ sql: 'INSERT INTO students (nama, nis, jk, kelas_id) VALUES (?,?,?,?)', args: [nama, nis, jkOf(r.jk), k.id] });
+    if (nis) nisSeen.add(nis);
+    nmSeen.add(key);
+  }
+  if (stmts.length) await db.batch(stmts);
+  return { added: stmts.length, skipped };
 });
 
 /* ----- absensi ----- */
@@ -191,25 +193,26 @@ on('GET', '/api/attendance', 'user', async ({ db, user, query }) => {
     FROM students s LEFT JOIN attendance a ON a.student_id = s.id AND a.tanggal = ? WHERE s.kelas_id = ? ORDER BY s.nama COLLATE NOCASE`).all(query.date, k.id);
   return { kelas: k, date: query.date, siswa };
 });
+
 on('PUT', '/api/attendance', 'user', async ({ db, user, body }) => {
   const k = await requireKelas(db, user, body.kelas_id);
   if (!validDate(body.date)) throw bad('Tanggal tidak valid.');
   if (!Array.isArray(body.entries) || body.entries.length > 500) throw bad('Data absensi tidak valid.');
   const ok = new Set((await db.prepare('SELECT id FROM students WHERE kelas_id = ?').all(k.id)).map((r) => Number(r.id)));
-  await tx(db, async (tdb) => {
-    const up = tdb.prepare(`INSERT INTO attendance (student_id, tanggal, status, catatan, updated_by, updated_at) VALUES (?,?,?,?,?,datetime('now'))
-      ON CONFLICT(student_id, tanggal) DO UPDATE SET status = excluded.status, catatan = excluded.catatan, updated_by = excluded.updated_by, updated_at = excluded.updated_at`);
-    const del = tdb.prepare('DELETE FROM attendance WHERE student_id = ? AND tanggal = ?');
-    for (const e of body.entries) {
-      const sid = Number(e.student_id);
-      if (!ok.has(sid)) throw bad('Ada siswa yang bukan dari kelas ini.');
-      const st = String(e.status || ''), cat = str(e.catatan, 200, 'Catatan');
-      if (!st && !cat) await del.run(sid, body.date);
-      else if (!st) throw bad('Pilih status kehadiran sebelum menulis catatan.');
-      else if (!['H', 'S', 'I', 'A'].includes(st)) throw bad('Status tidak valid.');
-      else await up.run(sid, body.date, st, cat, user.id);
-    }
-  });
+  const upSql = `INSERT INTO attendance (student_id, tanggal, status, catatan, updated_by, updated_at) VALUES (?,?,?,?,?,datetime('now'))
+    ON CONFLICT(student_id, tanggal) DO UPDATE SET status = excluded.status, catatan = excluded.catatan, updated_by = excluded.updated_by, updated_at = excluded.updated_at`;
+  const delSql = 'DELETE FROM attendance WHERE student_id = ? AND tanggal = ?';
+  const stmts = [];
+  for (const e of body.entries) {
+    const sid = Number(e.student_id);
+    if (!ok.has(sid)) throw bad('Ada siswa yang bukan dari kelas ini.');
+    const st = String(e.status || ''), cat = str(e.catatan, 200, 'Catatan');
+    if (!st && !cat) stmts.push({ sql: delSql, args: [sid, body.date] });
+    else if (!st) throw bad('Pilih status kehadiran sebelum menulis catatan.');
+    else if (!['H', 'S', 'I', 'A'].includes(st)) throw bad('Status tidak valid.');
+    else stmts.push({ sql: upSql, args: [sid, body.date, st, cat, user.id] });
+  }
+  if (stmts.length) await db.batch(stmts);
   return { ok: true };
 });
 
@@ -232,7 +235,8 @@ on('GET', '/api/rekap.csv', 'user', async ({ db, user, query, ctx }) => {
 on('GET', '/api/rekap.xlsx', 'user', async ({ db, user, query, ctx }) => {
   const k = await requireKelas(db, user, query.kelas_id);
   if (!reMonth.test(query.month || '')) throw bad('Bulan tidak valid.');
-  const buf = rekapWorkbook(await buildRekap(db, k, query.month), await school(db));
+  const [rekapData, schoolInfo] = await Promise.all([buildRekap(db, k, query.month), school(db)]);
+  const buf = rekapWorkbook(rekapData, schoolInfo);
   return ctx.raw(buf, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', `rekap-kelas-${k.nama}-${query.month}.xlsx`.replace(/[^\w.-]/g, '_'));
 });
 
@@ -255,9 +259,24 @@ async function setUserKelas(db, userId, ids) {
   }
 }
 on('GET', '/api/users', 'admin', async ({ db }) => {
-  const rows = await db.prepare('SELECT * FROM users ORDER BY role, nama COLLATE NOCASE').all();
-  const users = [];
-  for (const u of rows) users.push(await userOut(db, u));
+  const [rows, ukRows] = await Promise.all([
+    db.prepare('SELECT * FROM users ORDER BY role, nama COLLATE NOCASE').all(),
+    db.prepare('SELECT user_id, kelas_id FROM user_kelas').all()
+  ]);
+  const mapUk = new Map();
+  for (const r of ukRows) {
+    const uid = Number(r.user_id);
+    if (!mapUk.has(uid)) mapUk.set(uid, []);
+    mapUk.get(uid).push(Number(r.kelas_id));
+  }
+  const users = rows.map((u) => ({
+    id: Number(u.id),
+    username: u.username,
+    nama: u.nama,
+    role: u.role,
+    aktif: !!u.aktif,
+    kelas_ids: mapUk.get(Number(u.id)) || []
+  }));
   return { users };
 });
 on('POST', '/api/users', 'admin', async ({ db, body }) => {
@@ -310,8 +329,10 @@ on('DELETE', '/api/kelas/:id', 'admin', async ({ db, params }) => {
   return { ok: true };
 });
 on('PUT', '/api/school', 'admin', async ({ db, body }) => {
-  await setSetting(db, 'school_nama', reqStr(body.nama, 100, 'Nama sekolah'));
-  await setSetting(db, 'school_tahun', str(body.tahun, 20, 'Tahun ajaran'));
+  await db.batch([
+    { sql: 'INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['school_nama', reqStr(body.nama, 100, 'Nama sekolah')] },
+    { sql: 'INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['school_tahun', str(body.tahun, 20, 'Tahun ajaran')] }
+  ]);
   return { ok: true };
 });
 
