@@ -25,17 +25,22 @@ const HEADERS = {
   'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 };
 
-function initAdminIfNeeded(db) {
-  if (process.env.ADMIN_USER && process.env.ADMIN_PASSWORD && db.prepare('SELECT COUNT(*) c FROM users').get().c === 0) {
-    db.prepare('INSERT INTO users (username, nama, role, password_hash) VALUES (?,?,?,?)').run(
-      process.env.ADMIN_USER,
-      process.env.ADMIN_NAME || 'Administrator',
-      'admin',
-      auth.hashPassword(process.env.ADMIN_PASSWORD)
-    );
-    ['1', '2', '3', '4', '5', '6'].forEach((k) => db.prepare('INSERT OR IGNORE INTO kelas (nama) VALUES (?)').run(k));
-    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('school_nama', ?)").run(process.env.SCHOOL_NAME || 'Sekolah Dasar');
-    console.log('Akun admin awal dibuat dari variabel lingkungan.');
+async function initAdminIfNeeded(db) {
+  if (process.env.ADMIN_USER && process.env.ADMIN_PASSWORD) {
+    const row = await db.prepare('SELECT COUNT(*) c FROM users').get();
+    if (Number(row.c) === 0) {
+      await db.prepare('INSERT INTO users (username, nama, role, password_hash) VALUES (?,?,?,?)').run(
+        process.env.ADMIN_USER,
+        process.env.ADMIN_NAME || 'Administrator',
+        'admin',
+        auth.hashPassword(process.env.ADMIN_PASSWORD)
+      );
+      for (const k of ['1', '2', '3', '4', '5', '6']) {
+        await db.prepare('INSERT OR IGNORE INTO kelas (nama) VALUES (?)').run(k);
+      }
+      await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('school_nama', ?)").run(process.env.SCHOOL_NAME || 'Sekolah Dasar');
+      console.log('Akun admin awal dibuat dari variabel lingkungan.');
+    }
   }
 }
 
@@ -43,15 +48,14 @@ function createServer({
   dbFile = process.env.DB_PATH || (process.env.VERCEL ? '/tmp/absensi.db' : path.join(__dirname, 'data', 'absensi.db')),
   trustProxy = process.env.TRUST_PROXY === '1' || Boolean(process.env.VERCEL)
 } = {}) {
-  const dbDir = path.dirname(dbFile);
-  if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
-  }
-
   const db = open(dbFile);
-  initAdminIfNeeded(db);
-  auth.purgeExpired(db);
-  const purge = setInterval(() => auth.purgeExpired(db), 6 * 3600e3);
+  const initPromise = (async () => {
+    await db.ready;
+    await initAdminIfNeeded(db);
+    await auth.purgeExpired(db);
+  })().catch((err) => console.error('Database init error:', err));
+
+  const purge = setInterval(() => { auth.purgeExpired(db).catch(() => {}); }, 6 * 3600e3);
   purge.unref();
 
   function send(res, status, body, headers = {}) {
@@ -103,6 +107,9 @@ function createServer({
 
   const server = http.createServer(async (req, res) => {
     try {
+      await db.ready;
+      await initPromise;
+
       const url = new URL(req.url, 'http://x');
       const pathname = url.pathname;
       if (pathname === '/healthz') return sendJson(res, 200, { ok: true });
@@ -132,12 +139,12 @@ function createServer({
         const origin = req.headers.origin;
         if (origin && new URL(origin).host !== req.headers.host) throw new HttpError(403, 'Permintaan ditolak.');
       }
-      const user = auth.userFromToken(db, ctx.token);
+      const user = await auth.userFromToken(db, ctx.token);
       if (route.r.authLevel && !user) throw new HttpError(401, 'Silakan masuk terlebih dahulu.');
       if (route.r.authLevel === 'admin' && user.role !== 'admin') throw new HttpError(403, 'Hanya admin yang boleh melakukan ini.');
       const body = req.method === 'GET' || req.method === 'HEAD' ? {} : await readBody(req);
       const query = Object.fromEntries(url.searchParams);
-      const out = route.r.handler({ db, user, body, query, params: route.params, ctx });
+      const out = await route.r.handler({ db, user, body, query, params: route.params, ctx });
       const extra = setCookies.length ? { 'Set-Cookie': setCookies } : {};
       if (out && out.__raw) {
         return send(res, 200, out.body, {
