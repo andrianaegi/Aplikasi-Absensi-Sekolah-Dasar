@@ -26,6 +26,55 @@
   }
   function fail(e) { if (e && e.status !== 401) toast(e.message || 'Terjadi kesalahan.'); }
 
+  /* ---------- jam analog & digital ---------- */
+  function clockWidgetHtml() {
+    var ticks = '';
+    for (var i = 0; i < 60; i++) {
+      var major = i % 5 === 0;
+      ticks += '<line x1="50" y1="' + (major ? '5' : '6.5') + '" x2="50" y2="' + (major ? '12.5' : '9.5') + '" ' +
+        'stroke="' + (major ? '#0e7490' : '#94a3b8') + '" stroke-width="' + (major ? '2' : '1') + '" stroke-linecap="round" ' +
+        'transform="rotate(' + (i * 6) + ' 50 50)"/>';
+    }
+    return '<div id="liveClockWidget" style="display:inline-flex;align-items:center;gap:12px;background:#ffffff;border:1px solid rgba(14,116,144,.22);border-radius:14px;padding:6px 14px 6px 8px;box-shadow:0 2px 10px rgba(15,23,42,.06);color:#0f172a;flex-shrink:0" aria-label="Jam saat ini">' +
+      '<svg viewBox="0 0 100 100" width="54" height="54" aria-hidden="true" style="display:block;flex-shrink:0">' +
+        '<circle cx="50" cy="50" r="46" fill="#f8fafc" stroke="#0e7490" stroke-width="3"/>' +
+        ticks +
+        '<line id="clkH" x1="50" y1="53" x2="50" y2="26" stroke="#0f172a" stroke-width="3.6" stroke-linecap="round"/>' +
+        '<line id="clkM" x1="50" y1="54" x2="50" y2="17" stroke="#0e7490" stroke-width="2.4" stroke-linecap="round"/>' +
+        '<line id="clkS" x1="50" y1="58" x2="50" y2="13" stroke="#e11d48" stroke-width="1.3" stroke-linecap="round"/>' +
+        '<circle cx="50" cy="50" r="3.4" fill="#0f172a"/>' +
+        '<circle cx="50" cy="50" r="1.5" fill="#e11d48"/>' +
+      '</svg>' +
+      '<div style="line-height:1.25;text-align:left">' +
+        '<div id="clkDigi" style="font-variant-numeric:tabular-nums;font-weight:700;font-size:1.15rem;letter-spacing:.03em;color:#0e7490">00:00:00</div>' +
+        '<div id="clkDate" style="font-size:.75rem;color:#64748b;margin-top:2px">' + esc(tglPanjang(today)) + '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function updateClock() {
+    var now = new Date();
+    var newToday = ymd(now);
+    if (newToday !== today) {
+      if (S.date === today) S.date = newToday;
+      today = newToday;
+    }
+    var digi = $('#clkDigi');
+    if (!digi) return;
+    var h = now.getHours(), m = now.getMinutes(), s = now.getSeconds();
+    digi.textContent = pad(h) + ':' + pad(m) + ':' + pad(s);
+    var dt = $('#clkDate');
+    if (dt) dt.textContent = tglPanjang(newToday);
+    var hDeg = ((h % 12) + m / 60 + s / 3600) * 30;
+    var mDeg = (m + s / 60) * 6;
+    var sDeg = s * 6;
+    var elH = $('#clkH'), elM = $('#clkM'), elS = $('#clkS');
+    if (elH) elH.setAttribute('transform', 'rotate(' + hDeg + ' 50 50)');
+    if (elM) elM.setAttribute('transform', 'rotate(' + mDeg + ' 50 50)');
+    if (elS) elS.setAttribute('transform', 'rotate(' + sDeg + ' 50 50)');
+  }
+  setInterval(updateClock, 1000);
+
   /* ---------- state ---------- */
   var today = ymd(new Date());
   var S = { me: null, school: null, kelas: [], tab: 'harian', kelasId: null, date: today, month: today.slice(0, 7), rows: [], dirty: {}, saving: '', rekap: null, siswa: [], editId: null, imp: null, impResult: null, users: null, msg: '', online: navigator.onLine !== false };
@@ -46,7 +95,9 @@
   }
 
   function loginView(err) {
-    return '<div class="auth-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="auth panel"><span class="logo">' + ICON.logo + '</span><h1>Absensi Kelas SD</h1><p class="muted">Masuk dengan akun guru atau admin.</p>' + (err ? '<div class="err" role="alert">' + esc(err) + '</div>' : '') +
+    return '<div class="auth-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="auth panel">' +
+      '<div style="display:flex;justify-content:center;margin-bottom:14px">' + clockWidgetHtml() + '</div>' +
+      '<span class="logo">' + ICON.logo + '</span><h1>Absensi Kelas SD</h1><p class="muted">Masuk dengan akun guru atau admin.</p>' + (err ? '<div class="err" role="alert">' + esc(err) + '</div>' : '') +
       '<form data-form="login"><div class="field"><label for="lu">Nama pengguna</label><input type="text" id="lu" autocomplete="username" autocapitalize="none" required></div>' +
       '<div class="field"><label for="lp">Kata sandi</label><input type="password" id="lp" autocomplete="current-password" required></div>' +
       '<button class="btn primary" type="submit">Masuk</button></form></div>';
@@ -60,7 +111,7 @@
       '<div class="field"><label for="sp">Kata sandi (minimal 8 karakter)</label><input type="password" id="sp" autocomplete="new-password" minlength="8" required></div>' +
       '<button class="btn primary" type="submit">Buat akun dan mulai</button></form></div>';
   }
-  function view(html) { $('#app').innerHTML = html; }
+  function view(html) { $('#app').innerHTML = html; updateClock(); }
 
   /* ---------- layout ---------- */
   function shell(content) {
@@ -73,7 +124,10 @@
       '<header class="top"><div class="top-in"><div class="brand"><span class="logo">' + ICON.logo + '</span><div><h1>' + esc(S.school.nama) + '</h1><span class="sub">' + (S.school.tahun ? 'Tahun ajaran ' + esc(S.school.tahun) : 'Absensi kelas') + '</span></div>' +
       '<span class="save-state" id="saveState" role="status">' + esc(S.saving) + '</span>' +
       '<div class="who"><span>' + esc(S.me.nama) + ' <span class="badge">' + (admin ? 'Admin' : 'Guru') + '</span></span><button class="btn small" data-act="logout">Keluar</button></div></div>' +
-      '<p class="greet">' + greeting() + ', ' + esc(sapa) + '. Hari ini ' + esc(tglPanjang(today)) + '.</p>' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:6px 0 10px">' +
+        '<p class="greet" style="margin:0">' + greeting() + ', ' + esc(sapa) + '. Hari ini ' + esc(tglPanjang(today)) + '.</p>' +
+        clockWidgetHtml() +
+      '</div>' +
       '<nav class="tabs" role="tablist" aria-label="Menu utama">' + tabs.map(function (t) { return '<button role="tab" data-tab="' + t[0] + '" aria-selected="' + (S.tab === t[0]) + '">' + ICON[t[2]] + t[1] + '</button>'; }).join('') + '</nav></div></header>' +
       '<main id="main">' + content + '</main>';
   }
@@ -166,7 +220,6 @@
     });
     return h + '</div>';
   }
-  // Memperbarui angka, cincin, bilah, dan tombol tanpa menggambar ulang halaman
   function paintHarian() {
     var c = { H: 0, S: 0, I: 0, A: 0, B: 0 }, n = S.rows.length, byId = {};
     S.rows.forEach(function (r) { byId[r.id] = r; if (r.status) c[r.status]++; else c.B++; });
@@ -225,7 +278,7 @@
 
   /* ---------- Siswa + import ---------- */
   function parseDelimited(text) {
-    text = text.replace(/^﻿/, '');
+    text = text.replace(/^\uFEFF/, '');
     var first = text.split(/\r?\n/)[0] || '';
     var delim = [',', ';', '\t'].sort(function (a, b) { return first.split(b).length - first.split(a).length; })[0];
     var rows = [], row = [], cur = '', q = false, i, c;
